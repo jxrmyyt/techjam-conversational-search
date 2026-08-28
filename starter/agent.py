@@ -16,9 +16,11 @@ STOPWORDS = {
 # Fixed by the Agent API contract (docs/agent_api_contract.json) -- this is
 # the slot vocabulary. Nothing to invent here.
 ASK_ATTRIBUTE_PRIORITY = [
-    "category", "material", "color", "size", "budget",
+    "material", "color", "size", "budget",
     "style", "brand", "use_case", "feature",
-]
+]  # "category" deliberately excluded -- the customer's opener already names
+   # the coarse category, so asking about it again wastes a turn (confirmed
+   # against real simulator transcripts, see docs/dialog_patterns.md)
 
 # Cheap heuristic signal for the Intent Override scenario: the simulator's
 # scripted override message always reads "Actually, ignore my earlier
