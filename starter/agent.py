@@ -23,10 +23,23 @@ ASK_ATTRIBUTE_PRIORITY = [
 # Cheap heuristic signal for the Intent Override scenario: the simulator's
 # scripted override message always reads "Actually, ignore my earlier
 # preference. What I need is: <new_value>." (see evaluator/local_evaluator.py
-# behavior_for()). Detecting it lets us drop stale accumulated terms instead
-# of letting them dilute the query forever. This is a stand-in for the real
-# state-machine override detection Role B will own -- see the TODO below.
-OVERRIDE_RE = re.compile(r"\bactually\b.*\bignore\b|\bnever ?mind\b", re.IGNORECASE)
+# behavior_for()). Capturing the corrective clause (rather than the whole
+# sentence) avoids polluting the query with boilerplate words like "ignore"
+# and "preference" that don't appear in product text and just add noise.
+# This is a stand-in for the real state-machine override detection Role B
+# will own -- see the TODO below.
+OVERRIDE_RE = re.compile(
+    r"ignore my earlier preference.*?what i need is:\s*(.+?)[.!?]*$",
+    re.IGNORECASE,
+)
+
+# Cheap heuristic signal for the Buying-track opener: the simulator marks a
+# disclosed hard constraint explicitly ("A key requirement is: <value>.").
+# When present, treat it as a mandatory (AND) term rather than an optional
+# (OR) one -- Buying sessions benefit from precision over recall, since the
+# customer told us something specific up front. Browsing/Boundary sessions
+# never match this and stay on the broad OR path.
+BUYING_ANCHOR_RE = re.compile(r"key requirement is:\s*(.+?)[.!?]*$", re.IGNORECASE)
 
 
 def _text(value: object) -> str:
@@ -56,13 +69,18 @@ class _SessionState:
     just wide enough to prove that accumulation beats the stateless baseline.
     """
 
-    __slots__ = ("accumulated_terms", "profile_terms", "asked_attributes", "turn")
+    __slots__ = ("accumulated_terms", "profile_terms", "asked_attributes", "turn", "anchor_term")
 
     def __init__(self, profile_terms: list[str]) -> None:
         self.accumulated_terms: list[str] = []
         self.profile_terms = profile_terms
         self.asked_attributes: set[str] = set()
         self.turn = 0
+        # Buying-track anchor: the single most salient disclosed term, held
+        # as a mandatory (AND) constraint rather than optional (OR) recall.
+        # None for Browsing-style sessions, where broad recall matters more
+        # than early precision. This is the "dual-track routing" pillar.
+        self.anchor_term: str | None = None
 
 
 class Agent:
@@ -133,11 +151,27 @@ class Agent:
 
         # TODO(Role B): replace this heuristic with the real state-machine
         # override detection (contradiction check on structured slots, not
-        # a regex on the raw message).
-        if OVERRIDE_RE.search(user_message):
-            state.accumulated_terms.clear()
+        # a regex on the raw message). For now: on an override message, only
+        # extract the corrective clause -- not the whole sentence -- so
+        # boilerplate framing words don't get added as search terms. We
+        # deliberately do NOT clear prior accumulated terms: the override
+        # scenario replaces one specific preference, not the whole search
+        # (and we don't have access to which preference it was -- that's
+        # hidden simulator state a real agent never sees).
+        override_match = OVERRIDE_RE.search(user_message)
+        if override_match:
+            state.accumulated_terms.extend(_terms(override_match.group(1)))
+        else:
+            state.accumulated_terms.extend(_terms(user_message))
 
-        state.accumulated_terms.extend(_terms(user_message))
+        # Only set the anchor once (turn 1) -- a later turn matching this
+        # phrase would just be coincidence, not a fresh hard constraint.
+        if state.anchor_term is None:
+            anchor_match = BUYING_ANCHOR_RE.search(user_message)
+            if anchor_match:
+                anchor_terms = _terms(anchor_match.group(1))
+                if anchor_terms:
+                    state.anchor_term = anchor_terms[0]
 
         recommendations = self._retrieve(state, top_k)
 
@@ -161,7 +195,17 @@ class Agent:
         # the customer just told us this session.
         query_terms = list(dict.fromkeys(state.accumulated_terms))[:60]
         query_terms += [term for term in state.profile_terms if term not in query_terms][:6]
-        expression = " OR ".join(f'"{term}"' for term in query_terms)
+        query_terms = [term for term in query_terms if term != state.anchor_term]
+        optional_expression = " OR ".join(f'"{term}"' for term in query_terms)
+
+        if state.anchor_term and optional_expression:
+            # Buying track: the anchor term is mandatory, everything else
+            # stays optional recall on top of it.
+            expression = f'"{state.anchor_term}" AND ({optional_expression})'
+        elif state.anchor_term:
+            expression = f'"{state.anchor_term}"'
+        else:
+            expression = optional_expression
         if not expression:
             return []
         rows = self.connection.execute(
