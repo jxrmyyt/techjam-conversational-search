@@ -61,6 +61,76 @@ def _terms(text: str) -> list[str]:
         if len(token) > 1 and token.lower() not in STOPWORDS
     ]
 
+COLORS = {
+    "black",
+    "white",
+    "blue",
+    "red",
+    "green",
+    "brown",
+    "grey",
+    "gray",
+    "pink",
+    "beige",
+}
+
+MATERIALS = {
+    "cotton",
+    "leather",
+    "polyester",
+    "silk",
+    "wool",
+    "linen",
+    "denim",
+    "nylon",
+}
+
+
+def _classify_intent(text: str) -> str:
+    text = text.lower()
+
+    buying_signals = [
+        "key requirement",
+        "under $",
+        "budget",
+        "size",
+        "must be",
+    ]
+
+    if any(signal in text for signal in buying_signals):
+        return "buy"
+
+    return "browse"
+
+
+def _extract_slots(text: str) -> dict:
+    text = text.lower()
+    slots = {}
+
+    for color in COLORS:
+        if re.search(rf"\b{re.escape(color)}\b", text):
+            slots["color"] = color
+            break
+
+    for material in MATERIALS:
+        if re.search(rf"\b{re.escape(material)}\b", text):
+            slots["material"] = material
+            break
+
+    budget = re.search(
+        r"(?:under|below|less than|max|maximum)\s*\$?\s*(\d+(?:\.\d+)?)",
+        text,
+    )
+
+    if budget:
+        slots["budget"] = float(budget.group(1))
+
+    size = re.search(r"\bsize\s+([a-z0-9.]+)\b", text)
+
+    if size:
+        slots["size"] = size.group(1)
+
+    return slots
 
 class _SessionState:
     """Everything Role A's retrieval needs to remember about one session.
@@ -71,18 +141,37 @@ class _SessionState:
     just wide enough to prove that accumulation beats the stateless baseline.
     """
 
-    __slots__ = ("accumulated_terms", "profile_terms", "asked_attributes", "turn", "anchor_term")
+    __slots__ = (
+        "accumulated_terms",
+        "profile_terms",
+        "asked_attributes",
+        "turn",
+        "anchor_term",
+        "intent",
+        "slots",
+    )
 
     def __init__(self, profile_terms: list[str]) -> None:
         self.accumulated_terms: list[str] = []
         self.profile_terms = profile_terms
         self.asked_attributes: set[str] = set()
         self.turn = 0
+
         # Buying-track anchor: the single most salient disclosed term, held
         # as a mandatory (AND) constraint rather than optional (OR) recall.
         # None for Browsing-style sessions, where broad recall matters more
         # than early precision. This is the "dual-track routing" pillar.
         self.anchor_term: str | None = None
+
+        self.intent = "browse"
+
+        self.slots = {
+            "color": None,
+            "size": None,
+            "budget": None,
+            "brand": None,
+            "material": None,
+        }
 
 
 class Agent:
@@ -99,6 +188,7 @@ class Agent:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, _SessionState] = {}
+        self.product_meta = {}
         self._build_index()
 
     def _build_index(self) -> None:
@@ -112,6 +202,11 @@ class Agent:
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
+
+                self.product_meta[str(product["parent_asin"])] = {
+                    "price": product.get("price"),
+                    "store": product.get("store") or "",
+                }
                 batch.append(
                     (
                         str(product["parent_asin"]),
@@ -149,35 +244,37 @@ class Agent:
         state = self._sessions.get(session_id)
         if state is None:
             raise RuntimeError("reset must be called before respond")
+
         state.turn = turn
 
-        # TODO(Role B): replace this heuristic with the real state-machine
-        # override detection (contradiction check on structured slots, not
-        # a regex on the raw message). For now: on an override message, only
-        # extract the corrective clause -- not the whole sentence -- so
-        # boilerplate framing words don't get added as search terms. We
-        # deliberately do NOT clear prior accumulated terms: the override
-        # scenario replaces one specific preference, not the whole search
-        # (and we don't have access to which preference it was -- that's
-        # hidden simulator state a real agent never sees).
+        if turn == 1:
+            state.intent = _classify_intent(user_message)
+
         override_match = OVERRIDE_RE.search(user_message)
+
         if override_match:
             state.accumulated_terms.extend(_terms(override_match.group(1)))
         else:
             state.accumulated_terms.extend(_terms(user_message))
 
-        # Only set the anchor once (turn 1) -- a later turn matching this
-        # phrase would just be coincidence, not a fresh hard constraint.
+        new_slots = _extract_slots(user_message)
+
+        for key, value in new_slots.items():
+            state.slots[key] = value
+
         if state.anchor_term is None:
             anchor_match = BUYING_ANCHOR_RE.search(user_message)
+
             if anchor_match:
                 anchor_terms = _terms(anchor_match.group(1))
+
                 if anchor_terms:
                     state.anchor_term = anchor_terms[0]
 
         recommendations = self._retrieve(state, top_k)
 
         ask_attribute = self._next_attribute(state)
+
         if ask_attribute:
             state.asked_attributes.add(ask_attribute)
             message = f"Do you have a {ask_attribute.replace('_', ' ')} preference?"
@@ -188,34 +285,108 @@ class Agent:
             "message": message,
             "ask_attribute": ask_attribute,
             "recommendations": recommendations,
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            },
         }
 
-    def _retrieve(self, state: _SessionState, top_k: int) -> list[dict]:
-        # Accumulated terms carry full query weight; profile-tag terms are
-        # included but capped so a long preference list can't drown out what
-        # the customer just told us this session.
+    def _retrieve(
+        self,
+        state: _SessionState,
+        top_k: int,
+    ) -> list[dict[str, str]]:
+        if state.intent == "buy":
+            return self._retrieve_buy(state, top_k)
+
+        return self._retrieve_browse(state, top_k)
+
+    def _retrieve_buy(
+        self,
+        state: _SessionState,
+        top_k: int,
+    ) -> list[dict[str, str]]:
+        candidates = self._retrieve_browse(state, max(top_k * 5, 50))
+
+        budget = state.slots.get("budget")
+        brand = state.slots.get("brand")
+
+        filtered = []
+
+        for item in candidates:
+            asin = item["parent_asin"]
+            meta = self.product_meta.get(asin, {})
+
+            price = meta.get("price")
+            store = str(meta.get("store", "")).lower()
+
+            if budget is not None and price is not None:
+                try:
+                    if float(price) > float(budget):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+            if brand:
+                if brand.lower() not in store:
+                    continue
+
+            filtered.append(item)
+
+            if len(filtered) >= top_k:
+                break
+
+        if filtered:
+            return filtered
+
+        return candidates[:top_k]
+
+    def _retrieve_browse(
+        self,
+        state: _SessionState,
+        top_k: int,
+    ) -> list[dict[str, str]]:
         query_terms = list(dict.fromkeys(state.accumulated_terms))[:60]
-        query_terms += [term for term in state.profile_terms if term not in query_terms][:6]
-        query_terms = [term for term in query_terms if term != state.anchor_term]
-        optional_expression = " OR ".join(f'"{term}"' for term in query_terms)
+
+        query_terms += [
+            term
+            for term in state.profile_terms
+            if term not in query_terms
+        ][:6]
+
+        query_terms = [
+            term
+            for term in query_terms
+            if term != state.anchor_term
+        ]
+
+        optional_expression = " OR ".join(
+            f'"{term}"'
+            for term in query_terms
+        )
 
         if state.anchor_term and optional_expression:
-            # Buying track: the anchor term is mandatory, everything else
-            # stays optional recall on top of it.
-            expression = f'"{state.anchor_term}" AND ({optional_expression})'
+            expression = (
+                f'"{state.anchor_term}" AND ({optional_expression})'
+            )
         elif state.anchor_term:
             expression = f'"{state.anchor_term}"'
         else:
             expression = optional_expression
+
         if not expression:
             return []
+
         rows = self.connection.execute(
             "SELECT parent_asin FROM products WHERE products MATCH ? "
             "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
             (expression, top_k),
         ).fetchall()
-        return [{"parent_asin": str(row[0])} for row in rows]
+
+        return [
+            {"parent_asin": str(row[0])}
+            for row in rows
+        ]
 
     def _next_attribute(self, state: _SessionState) -> str | None:
         # Stop asking late so the last couple of turns are pure retrieval
@@ -223,7 +394,11 @@ class Agent:
         # can't be acted on before the turn budget runs out.
         if state.turn >= 6:
             return None
+
         for attribute in ASK_ATTRIBUTE_PRIORITY:
-            if attribute not in state.asked_attributes:
+            if (
+                attribute not in state.asked_attributes
+                            ):
                 return attribute
+
         return None
