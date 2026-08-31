@@ -1,0 +1,19 @@
+# Core agent (starter/agent.py) needs NOTHING beyond the Python standard
+# library for the active submission path (BM25 retrieval via sqlite3's
+# built-in FTS5, everything else is stdlib re/json/pathlib).
+#
+# numpy/spacy (dense/hybrid semantic retrieval, v7) and llama-cpp-python
+# (Stage 2 LLM re-ranker, v9) were both built, measured on the real
+# evaluator, and confirmed net-negative -- see DAY1_PROGRESS.md "v7" and
+# "v16-v18". Both are fully removed as hard dependencies: dense/hybrid's
+# code was deleted outright, and the LLM re-ranker's code is kept (real,
+# working Stage 2 infrastructure, documented for technical merit) but is no
+# longer imported or loaded by default -- `_load_llm`'s `from llama_cpp
+# import Llama` is a lazy import, only reached if `Agent(llm_model_path=...)`
+# is explicitly passed. This means agent.py runs correctly even in an
+# environment with neither package installed, which is the actual
+# submission path.
+#
+# To opt back into the LLM re-ranker for experimentation (not the default,
+# not recommended -- see DAY1_PROGRESS.md for why):
+#   pip install llama-cpp-python==0.3.35
