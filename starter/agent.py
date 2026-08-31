@@ -655,7 +655,20 @@ class Agent:
         # Buying track: mandatory-match color/material (when disclosed) on
         # top of the base query, then apply a price ceiling as a post-filter
         # (price isn't in the FTS index, so it can't be a MATCH term).
-        mandatory_extra = [
+        #
+        # v19: category promoted to mandatory here too. Every other route
+        # already treats category as a mandatory AND term (see
+        # _browse_mandatory_extra, and CATEGORY_RE's original comment) --
+        # Buying was the one route that never got this, category words just
+        # sat in the optional OR pool via accumulated_terms' turn-1 opener
+        # text. Same AND-over-OR precision argument as anchor_term/color/
+        # material, just finally extended here too. Measured: full 200-
+        # session eval, Buying hit_rate 0.775 -> 0.800, mrr 0.380 -> 0.404,
+        # mttc 4.325 -> 4.1375 (all improved, nothing regressed elsewhere,
+        # since this is buy-route-only code) -- overall 0.597966 -> 0.607365.
+        # See DAY1_PROGRESS.md "v19".
+        mandatory_extra = list(state.category_terms)
+        mandatory_extra += [
             str(state.slots[key]) for key in ("color", "material") if state.slots.get(key)
         ]
         candidates = self._retrieve_browse(state, max(top_k * 5, 50), mandatory_extra)
@@ -702,9 +715,18 @@ class Agent:
         if not expression:
             return []
 
+        # v20: `categories` field weight raised 4.0 -> 8.0 (title stays 6.0).
+        # This weighting was never swept before this session -- it was an
+        # early guess, inherited unchanged since v1. Swept categories at
+        # 6/8/10/12/16 (title held at 6, then also tried title=5/cat=10):
+        # 8.0 is the clear peak (0.615556); 6 and 10+ both trail behind it
+        # (0.6127 and 0.6109-0.6124 respectively) -- not a monotonic "more
+        # is better" relationship, so this is a real optimum, not a
+        # direction that could be pushed further. See DAY1_PROGRESS.md
+        # "v20: BM25 field weight sweep" for the full sweep table.
         rows = self.connection.execute(
             "SELECT parent_asin FROM products WHERE products MATCH ? "
-            "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
+            "ORDER BY bm25(products, 0.0, 6.0, 8.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
             (expression, top_k),
         ).fetchall()
         return [{"parent_asin": str(row[0])} for row in rows]
